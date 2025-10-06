@@ -1,5 +1,5 @@
 {
-  "name": "@modbus-manager/agent",
+  "name": "@thammond17/modbus-manager-agent",
   "version": "0.1.0",
   "description": "Local agent for connecting Modbus devices to Modbus Manager cloud platform",
   "main": "agent.js",
