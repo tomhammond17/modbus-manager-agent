@@ -2,7 +2,7 @@
 
 Local agent for connecting Modbus devices to Modbus Manager cloud platform.
 
-> **Version 0.1.0** - Production ready for industrial automation
+> **Production Ready** - Automated npm deployment
 
 ## Installation
 
