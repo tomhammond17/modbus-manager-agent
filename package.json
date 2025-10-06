@@ -1,0 +1,45 @@
+{
+  "name": "@modbus-manager/agent",
+  "version": "0.1.0",
+  "description": "Local agent for connecting Modbus devices to Modbus Manager cloud platform",
+  "main": "agent.js",
+  "bin": {
+    "modbus-agent": "./agent.js"
+  },
+  "scripts": {
+    "start": "node agent.js",
+    "test": "echo \"No tests yet\" && exit 0"
+  },
+  "keywords": [
+    "modbus",
+    "iot",
+    "edge",
+    "agent",
+    "industrial",
+    "automation",
+    "scada",
+    "plc"
+  ],
+  "author": "Tom Hammond",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tomhammond17/modbus-manager-agent"
+  },
+  "homepage": "https://github.com/tomhammond17/modbus-manager-agent#readme",
+  "bugs": {
+    "url": "https://github.com/tomhammond17/modbus-manager-agent/issues"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "ws": "^8.18.0",
+    "commander": "^12.0.0",
+    "modbus-serial": "^8.0.17"
+  },
+  "files": [
+    "agent.js",
+    "README.md"
+  ]
+}
