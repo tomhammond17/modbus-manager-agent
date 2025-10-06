@@ -2,22 +2,24 @@
 
 Local agent for connecting Modbus devices to Modbus Manager cloud platform.
 
+> **Version 0.1.0** - Production ready for industrial automation
+
 ## Installation
 
 **Option 1: Run with npx (no installation needed)**
 ```bash
-npx @modbus-manager/agent --token=YOUR_REGISTRATION_TOKEN
+npx @thammond17/modbus-manager-agent --token=YOUR_REGISTRATION_TOKEN
 ```
 
 **Option 2: Install globally**
 ```bash
-npm install -g @modbus-manager/agent
+npm install -g @thammond17/modbus-manager-agent
 modbus-agent --token=YOUR_REGISTRATION_TOKEN
 ```
 
 **Option 3: Install locally in a project**
 ```bash
-npm install @modbus-manager/agent
+npm install @thammond17/modbus-manager-agent
 npx modbus-agent --token=YOUR_REGISTRATION_TOKEN
 ```
 
@@ -36,7 +38,7 @@ npx modbus-agent --token=YOUR_REGISTRATION_TOKEN
 
 ```bash
 # Run directly with npx (easiest)
-npx @modbus-manager/agent --token=abc123...
+npx @thammond17/modbus-manager-agent --token=abc123...
 
 # The agent will:
 # ✅ Connect to Modbus Manager cloud

@@ -1,0 +1,8 @@
+install.sh
+install.bat
+node_modules/
+.DS_Store
+*.log
+.env
+.vscode/
+.idea/

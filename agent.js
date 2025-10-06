@@ -94,6 +94,13 @@ class ModbusAgent {
 
     try {
       switch (message.type) {
+        case 'connected':
+          // Server acknowledgment - agent successfully connected
+          console.log(`✅ Server confirmed connection`);
+          break;
+        case 'heartbeat_ack':
+          // Server acknowledged heartbeat - connection is healthy
+          break;
         case 'network_scan':
           await this.handleNetworkScan(message);
           break;
