@@ -1,83 +1,326 @@
 #!/usr/bin/env node
 
-/**
- * Modbus Manager - Local Agent
- * Connects local Modbus devices to the cloud platform
- * Supports both Modbus TCP and RTU protocols
- */
-
 const WebSocket = require('ws');
-const { program } = require('commander');
 const ModbusRTU = require('modbus-serial');
+const { program } = require('commander');
 
-const WEBSOCKET_URL = 'wss://ckdjiovqshugcprabpty.supabase.co/functions/v1/agent-websocket';
+// ============================================================================
+// VALUE CACHE - Tracks last known values for report-by-exception
+// ============================================================================
+class ValueCache {
+  constructor() {
+    this.cache = new Map(); // key: `${deviceId}:${registerId}`, value: number
+  }
 
+  updateValue(deviceId, registerId, value) {
+    const key = `${deviceId}:${registerId}`;
+    const lastValue = this.cache.get(key);
+    const hasChanged = lastValue !== value;
+    this.cache.set(key, value);
+    return hasChanged;
+  }
+
+  getLastValue(deviceId, registerId) {
+    const key = `${deviceId}:${registerId}`;
+    return this.cache.get(key);
+  }
+
+  getAllValues() {
+    const result = [];
+    for (const [key, value] of this.cache.entries()) {
+      const [deviceId, registerId] = key.split(':');
+      result.push({ deviceId, registerId, value });
+    }
+    return result;
+  }
+
+  clearCache() {
+    this.cache.clear();
+  }
+}
+
+// ============================================================================
+// DATA TRANSMIT BUFFER - Manages batched WebSocket transmissions
+// ============================================================================
+class DataTransmitBuffer {
+  constructor(fullRefreshInterval = 300000) { // 5 minutes default
+    this.changeBuffer = [];
+    this.lastFullRefresh = Date.now();
+    this.fullRefreshInterval = fullRefreshInterval;
+  }
+
+  queueChange(deviceId, registerId, value, timestamp = new Date().toISOString()) {
+    this.changeBuffer.push({ deviceId, registerId, value, timestamp });
+  }
+
+  shouldSendFullRefresh() {
+    return Date.now() - this.lastFullRefresh >= this.fullRefreshInterval;
+  }
+
+  getBufferedChanges() {
+    const changes = [...this.changeBuffer];
+    this.changeBuffer = [];
+    return changes;
+  }
+
+  resetFullRefreshTimer() {
+    this.lastFullRefresh = Date.now();
+  }
+}
+
+// ============================================================================
+// HISTORICAL DATA BUFFER - Stores all reads for bulk upload
+// ============================================================================
+class HistoricalDataBuffer {
+  constructor(maxBufferSize = 10000) {
+    this.dataPoints = [];
+    this.maxBufferSize = maxBufferSize;
+  }
+
+  addDataPoint(deviceId, registerId, value, timestamp = new Date().toISOString(), quality = 'good') {
+    this.dataPoints.push({ deviceId, registerId, value, timestamp, quality });
+    
+    // Prevent memory overflow
+    if (this.dataPoints.length > this.maxBufferSize) {
+      console.warn(`[HistoricalDataBuffer] Buffer size exceeded ${this.maxBufferSize}, dropping oldest records`);
+      this.dataPoints = this.dataPoints.slice(-this.maxBufferSize);
+    }
+  }
+
+  getBufferedData() {
+    return [...this.dataPoints];
+  }
+
+  clearBuffer() {
+    this.dataPoints = [];
+  }
+
+  size() {
+    return this.dataPoints.length;
+  }
+}
+
+// ============================================================================
+// REGISTER OPTIMIZER - Groups contiguous registers for efficient Modbus reads
+// ============================================================================
+class RegisterOptimizer {
+  static optimizeRegisterReads(registers, maxBlockSize = 125) {
+    if (!registers || registers.length === 0) return [];
+
+    // Sort by address
+    const sorted = [...registers].sort((a, b) => a.address - b.address);
+    const blocks = [];
+    let currentBlock = [sorted[0]];
+
+    for (let i = 1; i < sorted.length; i++) {
+      const current = sorted[i];
+      const last = currentBlock[currentBlock.length - 1];
+      
+      // Check if contiguous and within max block size
+      const isContiguous = current.address === last.address + 1;
+      const wouldExceedMax = currentBlock.length >= maxBlockSize;
+
+      if (isContiguous && !wouldExceedMax) {
+        currentBlock.push(current);
+      } else {
+        blocks.push(currentBlock);
+        currentBlock = [current];
+      }
+    }
+    
+    if (currentBlock.length > 0) {
+      blocks.push(currentBlock);
+    }
+
+    // Convert to read commands
+    return blocks.map(block => ({
+      startAddress: block[0].address,
+      count: block.length,
+      registers: block,
+    }));
+  }
+}
+
+// ============================================================================
+// POLLING SCHEDULER - Manages internal polling timers
+// ============================================================================
+class PollingScheduler {
+  constructor(agent) {
+    this.agent = agent;
+    this.timers = new Map(); // key: groupId, value: interval handle
+    this.config = null;
+  }
+
+  startPolling(config) {
+    this.stopPolling();
+    this.config = config;
+
+    console.log('[PollingScheduler] Starting polling with config:', JSON.stringify(config, null, 2));
+
+    for (const device of config.devices) {
+      for (const group of device.pollGroups) {
+        const timerId = setInterval(() => {
+          this.pollGroup(device, group);
+        }, group.interval);
+
+        this.timers.set(group.groupId, timerId);
+        console.log(`[PollingScheduler] Started poll group ${group.groupId} for device ${device.deviceId} at ${group.interval}ms interval`);
+      }
+    }
+  }
+
+  async pollGroup(device, group) {
+    try {
+      console.log(`[PollingScheduler] Polling group ${group.groupId} on device ${device.deviceId}`);
+
+      // Connect to device if not already connected
+      const client = await this.agent.connectToDevice(device.connectionParams);
+      if (!client) {
+        console.error(`[PollingScheduler] Failed to connect to device ${device.deviceId}`);
+        return;
+      }
+
+      // Optimize register reads
+      const optimizedReads = RegisterOptimizer.optimizeRegisterReads(group.registers);
+      console.log(`[PollingScheduler] Optimized ${group.registers.length} registers into ${optimizedReads.length} read commands`);
+
+      const timestamp = new Date().toISOString();
+
+      // Execute optimized reads
+      for (const readCmd of optimizedReads) {
+        try {
+          const data = await client.readHoldingRegisters(readCmd.startAddress, readCmd.count);
+          
+          // Process each register value
+          readCmd.registers.forEach((register, index) => {
+            const value = data.data[index];
+            const hasChanged = this.agent.valueCache.updateValue(device.deviceId, register.registerId, value);
+
+            // Add to historical buffer (all data)
+            this.agent.historicalBuffer.addDataPoint(
+              device.deviceId,
+              register.registerId,
+              value,
+              timestamp,
+              'good'
+            );
+
+            // Add to transmit buffer only if changed (report-by-exception)
+            if (hasChanged || this.agent.transmitBuffer.shouldSendFullRefresh()) {
+              this.agent.transmitBuffer.queueChange(
+                device.deviceId,
+                register.registerId,
+                value,
+                timestamp
+              );
+            }
+          });
+        } catch (readError) {
+          console.error(`[PollingScheduler] Error reading registers ${readCmd.startAddress}-${readCmd.startAddress + readCmd.count - 1}:`, readError.message);
+          
+          // Mark registers as bad quality in historical buffer
+          readCmd.registers.forEach(register => {
+            this.agent.historicalBuffer.addDataPoint(
+              device.deviceId,
+              register.registerId,
+              null,
+              timestamp,
+              'bad'
+            );
+          });
+        }
+      }
+
+    } catch (error) {
+      console.error(`[PollingScheduler] Error polling group ${group.groupId}:`, error.message);
+    }
+  }
+
+  stopPolling() {
+    for (const [groupId, timerId] of this.timers.entries()) {
+      clearInterval(timerId);
+      console.log(`[PollingScheduler] Stopped poll group ${groupId}`);
+    }
+    this.timers.clear();
+  }
+
+  updateSchedule(newConfig) {
+    console.log('[PollingScheduler] Updating polling schedule');
+    this.startPolling(newConfig);
+  }
+}
+
+// ============================================================================
+// MODBUS MANAGER AGENT - Main agent class
+// ============================================================================
 class ModbusAgent {
   constructor(token) {
     this.token = token;
     this.ws = null;
-    this.modbusClient = new ModbusRTU();
-    this.reconnectInterval = 5000;
+    this.agentId = null;
+    this.reconnectTimeout = null;
     this.heartbeatInterval = null;
+    this.batchTransmitInterval = null;
+    this.historicalUploadInterval = null;
+    this.deviceConnections = new Map(); // Cache Modbus connections
+
+    // Polling engine components
+    this.valueCache = new ValueCache();
+    this.transmitBuffer = new DataTransmitBuffer(300000); // 5 min full refresh
+    this.historicalBuffer = new HistoricalDataBuffer(10000);
+    this.pollingScheduler = new PollingScheduler(this);
+
+    // Configuration
+    this.batchWindow = 2000; // 2 seconds
+    this.historicalBatchInterval = 60000; // 1 minute
   }
 
-  async connect() {
-    try {
-      console.log('🔌 Connecting to Modbus Manager...');
-      console.log(`⏱️  Connection timeout: ${this.reconnectInterval}ms`);
-      
-      this.ws = new WebSocket(`${WEBSOCKET_URL}?token=${this.token}`, {
-        handshakeTimeout: 10000, // 10 second timeout
-      });
+  connect() {
+    const wsUrl = `wss://ckdjiovqshugcprabpty.supabase.co/functions/v1/agent-websocket`;
+    
+    console.log('Connecting to Modbus Manager...');
+    
+    this.ws = new WebSocket(wsUrl, {
+      headers: {
+        'Authorization': `Bearer ${this.token}`
+      }
+    });
 
-      this.ws.on('open', () => {
-        console.log('✅ Connected successfully!');
-        console.log('📡 Agent is now online and ready to receive commands');
-        console.log('🔧 Supports: Modbus TCP & RTU\n');
-        this.startHeartbeat();
-      });
+    this.ws.on('open', () => {
+      console.log('✓ Connected to Modbus Manager');
+      this.startHeartbeat();
+      this.startBatchTransmit();
+      this.startHistoricalUpload();
+    });
 
-      this.ws.on('message', (data) => {
-        try {
-          const message = JSON.parse(data.toString());
-          console.log(`📨 Message received: type=${message.type}, command_id=${message.command_id || 'N/A'}`);
-          this.handleCommand(message);
-        } catch (parseError) {
-          console.error('❌ Failed to parse WebSocket message:', parseError.message);
-          console.error('📄 Raw message:', data.toString());
-        }
-      });
+    this.ws.on('message', (data) => {
+      try {
+        const message = JSON.parse(data.toString());
+        this.handleCommand(message);
+      } catch (error) {
+        console.error('Error parsing message:', error.message);
+      }
+    });
 
-      this.ws.on('close', (code, reason) => {
-        console.log(`❌ Connection closed (Code: ${code}, Reason: ${reason || 'No reason provided'})`);
-        console.log(`⏳ Reconnecting in ${this.reconnectInterval / 1000}s...`);
-        this.stopHeartbeat();
-        setTimeout(() => this.connect(), this.reconnectInterval);
-      });
+    this.ws.on('close', () => {
+      console.log('✗ Disconnected from Modbus Manager');
+      this.stopHeartbeat();
+      this.stopBatchTransmit();
+      this.stopHistoricalUpload();
+      this.scheduleReconnect();
+    });
 
-      this.ws.on('error', (error) => {
-        console.error('❌ WebSocket error:', error.message);
-        console.error('🔍 Error details:', {
-          code: error.code,
-          syscall: error.syscall,
-          address: error.address
-        });
-      });
-
-    } catch (error) {
-      console.error('❌ Connection failed:', error.message);
-      console.error('🔍 Stack trace:', error.stack);
-      console.log(`⏳ Retrying in ${this.reconnectInterval / 1000}s...`);
-      setTimeout(() => this.connect(), this.reconnectInterval);
-    }
+    this.ws.on('error', (error) => {
+      console.error('WebSocket error:', error.message);
+    });
   }
 
   startHeartbeat() {
     this.heartbeatInterval = setInterval(() => {
-      if (this.ws?.readyState === WebSocket.OPEN) {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
         this.ws.send(JSON.stringify({ type: 'heartbeat' }));
       }
-    }, 30000);
+    }, 30000); // 30 seconds
   }
 
   stopHeartbeat() {
@@ -87,348 +330,376 @@ class ModbusAgent {
     }
   }
 
-  async handleCommand(message) {
-    const startTime = Date.now();
-    console.log(`📥 Received command: ${message.type} (ID: ${message.command_id || 'N/A'})`);
-    console.log(`🔧 Parameters:`, JSON.stringify(message.params || {}, null, 2));
+  startBatchTransmit() {
+    this.batchTransmitInterval = setInterval(() => {
+      this.sendBatchedUpdates();
+    }, this.batchWindow);
+  }
+
+  stopBatchTransmit() {
+    if (this.batchTransmitInterval) {
+      clearInterval(this.batchTransmitInterval);
+      this.batchTransmitInterval = null;
+    }
+  }
+
+  startHistoricalUpload() {
+    this.historicalUploadInterval = setInterval(() => {
+      this.uploadHistoricalData();
+    }, this.historicalBatchInterval);
+  }
+
+  stopHistoricalUpload() {
+    if (this.historicalUploadInterval) {
+      clearInterval(this.historicalUploadInterval);
+      this.historicalUploadInterval = null;
+    }
+  }
+
+  sendBatchedUpdates() {
+    const isFullRefresh = this.transmitBuffer.shouldSendFullRefresh();
+    let updates;
+
+    if (isFullRefresh) {
+      updates = this.valueCache.getAllValues();
+      this.transmitBuffer.resetFullRefreshTimer();
+      console.log(`[BatchTransmit] Sending full refresh with ${updates.length} values`);
+    } else {
+      updates = this.transmitBuffer.getBufferedChanges();
+      if (updates.length === 0) return; // Nothing to send
+      console.log(`[BatchTransmit] Sending ${updates.length} changed values`);
+    }
+
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({
+        type: 'data_update',
+        timestamp: new Date().toISOString(),
+        isFullRefresh,
+        updates,
+      }));
+    }
+  }
+
+  async uploadHistoricalData() {
+    const dataPoints = this.historicalBuffer.getBufferedData();
+    if (dataPoints.length === 0) return;
+
+    console.log(`[HistoricalUpload] Uploading ${dataPoints.length} data points to cloud`);
 
     try {
-      switch (message.type) {
-        case 'connected':
-          // Server acknowledgment - agent successfully connected
-          console.log(`✅ Server confirmed connection`);
+      const response = await fetch('https://ckdjiovqshugcprabpty.supabase.co/functions/v1/ingest-batch', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${this.token}`,
+        },
+        body: JSON.stringify({
+          agentId: this.agentId,
+          dataPoints,
+        }),
+      });
+
+      const result = await response.json();
+      
+      if (result.success) {
+        console.log(`[HistoricalUpload] Successfully uploaded ${result.inserted} records`);
+        this.historicalBuffer.clearBuffer();
+      } else {
+        console.error('[HistoricalUpload] Upload failed:', result.error || result.errors);
+      }
+    } catch (error) {
+      console.error('[HistoricalUpload] Error uploading historical data:', error.message);
+    }
+  }
+
+  scheduleReconnect() {
+    if (this.reconnectTimeout) return;
+    
+    console.log('Reconnecting in 5 seconds...');
+    this.reconnectTimeout = setTimeout(() => {
+      this.reconnectTimeout = null;
+      this.connect();
+    }, 5000);
+  }
+
+  async handleCommand(message) {
+    const { command, commandId, params } = message;
+    
+    console.log(`Received command: ${command}`, params);
+
+    try {
+      switch (command) {
+        case 'set_polling_config':
+          await this.handleSetPollingConfig(message);
           break;
-        case 'heartbeat_ack':
-          // Server acknowledged heartbeat - connection is healthy
-          break;
+
         case 'network_scan':
           await this.handleNetworkScan(message);
           break;
+
         case 'modbus_read':
           await this.handleModbusRead(message);
           break;
+
         case 'modbus_write':
           await this.handleModbusWrite(message);
           break;
+
         case 'test_communication':
           await this.handleTestCommunication(message);
           break;
+
         default:
-          console.log(`⚠️  Unknown command type: ${message.type}`);
-          this.sendError(message.command_id, `Unknown command type: ${message.type}`);
+          console.log(`Unknown command: ${command}`);
       }
-      
-      const duration = Date.now() - startTime;
-      console.log(`✅ Command ${message.type} completed in ${duration}ms`);
     } catch (error) {
-      const duration = Date.now() - startTime;
-      console.error(`❌ Error handling command after ${duration}ms:`, error.message);
-      console.error('🔍 Stack trace:', error.stack);
-      this.sendError(message.command_id, error.message);
+      console.error(`Error handling command ${command}:`, error.message);
+      this.sendError(commandId, error.message);
+    }
+  }
+
+  async handleSetPollingConfig(message) {
+    const { commandId, params } = message;
+    
+    console.log('[SetPollingConfig] Received new polling configuration');
+
+    try {
+      // Update configuration settings
+      if (params.fullRefreshInterval) {
+        this.transmitBuffer.fullRefreshInterval = params.fullRefreshInterval;
+      }
+      if (params.batchWindow) {
+        this.batchWindow = params.batchWindow;
+        this.stopBatchTransmit();
+        this.startBatchTransmit();
+      }
+      if (params.historicalBatchInterval) {
+        this.historicalBatchInterval = params.historicalBatchInterval;
+        this.stopHistoricalUpload();
+        this.startHistoricalUpload();
+      }
+
+      // Start polling with new configuration
+      this.pollingScheduler.updateSchedule(params);
+
+      this.sendResult(commandId, 'polling_config_set', {
+        success: true,
+        message: 'Polling configuration applied successfully',
+        devices: params.devices?.length || 0,
+        totalPollGroups: params.devices?.reduce((sum, d) => sum + (d.pollGroups?.length || 0), 0) || 0,
+      });
+    } catch (error) {
+      this.sendError(commandId, `Failed to set polling config: ${error.message}`);
     }
   }
 
   async connectToDevice(params) {
-    const protocol = params.protocol || 'tcp';
+    const cacheKey = JSON.stringify(params);
     
+    // Return cached connection if available
+    if (this.deviceConnections.has(cacheKey)) {
+      return this.deviceConnections.get(cacheKey);
+    }
+
+    const client = new ModbusRTU();
+
     try {
-      if (protocol === 'tcp') {
-        const ip = params.ip || params.deviceIp || params.device_ip;
-        const port = params.port || params.device_port || 502;
-        
-        if (!ip) {
-          throw new Error('IP address is required for TCP connection');
-        }
-        
-        console.log(`🔌 Connecting via Modbus TCP to ${ip}:${port}`);
-        console.log(`⏱️  Connection timeout: ${params.timeout || 5000}ms`);
-        
-        await Promise.race([
-          this.modbusClient.connectTCP(ip, { port }),
-          new Promise((_, reject) => 
-            setTimeout(() => reject(new Error('TCP connection timeout')), params.timeout || 5000)
-          )
-        ]);
-        
-        console.log(`✓ TCP connection established`);
-      } else if (protocol === 'rtu') {
-        const serialPort = params.serialPort || params.serial_port;
-        const baudRate = params.baudRate || params.baud_rate || 9600;
-        const parity = params.parity || 'none';
-        const dataBits = params.dataBits || params.data_bits || 8;
-        const stopBits = params.stopBits || params.stop_bits || 1;
-        
-        if (!serialPort) {
-          throw new Error('Serial port is required for RTU connection');
-        }
-        
-        console.log(`🔌 Connecting via Modbus RTU to ${serialPort} (${baudRate}/${parity}/${dataBits}/${stopBits})`);
-        
-        await this.modbusClient.connectRTUBuffered(serialPort, {
-          baudRate,
-          parity,
-          dataBits,
-          stopBits
+      if (params.protocol === 'tcp') {
+        await client.connectTCP(params.deviceIp || params.ip, { port: params.port || 502 });
+        client.setID(params.unitId || 1);
+      } else if (params.protocol === 'rtu') {
+        await client.connectRTUBuffered(params.serialPort, {
+          baudRate: params.baudRate || 9600,
+          parity: params.parity || 'none',
+          dataBits: params.dataBits || 8,
+          stopBits: params.stopBits || 1,
         });
-        
-        console.log(`✓ RTU connection established`);
-      } else {
-        throw new Error(`Unsupported protocol: ${protocol}`);
+        client.setID(params.unitId || 1);
       }
-      
-      const unitId = params.unitId || params.slave_id || params.unit_id || 1;
-      console.log(`🎯 Setting Unit ID: ${unitId}`);
-      this.modbusClient.setID(unitId);
-      
-      if (params.timeout) {
-        console.log(`⏱️  Setting Modbus timeout: ${params.timeout}ms`);
-        this.modbusClient.setTimeout(params.timeout);
-      }
+
+      client.setTimeout(5000);
+      this.deviceConnections.set(cacheKey, client);
+      return client;
     } catch (error) {
-      console.error(`❌ Device connection failed:`, error.message);
-      throw error;
+      console.error('Device connection error:', error.message);
+      return null;
     }
   }
 
   async handleNetworkScan(message) {
-    console.log('🔍 Scanning for Modbus devices...');
-    
-    const devices = [];
-    const errors = [];
-    const { start_address = 1, end_address = 247, timeout = 500, protocol = 'tcp' } = message.params || {};
-    const totalAddresses = end_address - start_address + 1;
+    const { commandId, params } = message;
+    const results = [];
 
-    console.log(`📊 Scan range: ${start_address}-${end_address} (${totalAddresses} addresses)`);
-    console.log(`⏱️  Timeout per address: ${timeout}ms`);
-    console.log(`🔌 Protocol: ${protocol.toUpperCase()}`);
+    try {
+      const ipRange = params.ipRange || '192.168.1.1-254';
+      const [baseIp, range] = ipRange.split('-');
+      const [a, b, c, start] = baseIp.split('.').map(Number);
+      const end = parseInt(range) || start;
 
-    for (let address = start_address; address <= end_address; address++) {
-      const progress = Math.round(((address - start_address + 1) / totalAddresses) * 100);
-      process.stdout.write(`\r📡 Progress: ${progress}% (${address}/${end_address})`);
-      
-      try {
-        await this.connectToDevice({ ...message.params, unit_id: address, timeout });
-
-        // Try reading a register to verify device
-        await Promise.race([
-          this.modbusClient.readHoldingRegisters(0, 1),
-          new Promise((_, reject) => 
-            setTimeout(() => reject(new Error('Read timeout')), timeout)
-          )
-        ]);
-        
-        devices.push({
-          address,
-          type: 'unknown',
-          status: 'responding',
-          protocol
+      for (let i = start; i <= end; i++) {
+        const ip = `${a}.${b}.${c}.${i}`;
+        const client = await this.connectToDevice({
+          protocol: 'tcp',
+          deviceIp: ip,
+          port: params.port || 502,
+          unitId: 1,
         });
 
-        console.log(`\n✓ Found device at address ${address}`);
-        
-        this.modbusClient.close(() => {});
-      } catch (error) {
-        // Device not found at this address - this is expected
-        if (error.message !== 'Read timeout' && error.message !== 'TCP connection timeout') {
-          errors.push({ address, error: error.message });
-        }
-        try {
-          this.modbusClient.close(() => {});
-        } catch (closeError) {
-          // Ignore close errors
+        if (client) {
+          try {
+            await client.readHoldingRegisters(0, 1);
+            results.push({ ip, status: 'online', port: params.port || 502 });
+            console.log(`✓ Found device at ${ip}`);
+          } catch {
+            // Device didn't respond
+          }
         }
       }
-    }
 
-    console.log(`\n✅ Scan complete. Found ${devices.length} device(s)`);
-    if (errors.length > 0) {
-      console.log(`⚠️  ${errors.length} error(s) encountered during scan`);
+      this.sendResult(commandId, 'scan_result', { devices: results });
+    } catch (error) {
+      this.sendError(commandId, error.message);
     }
-    
-    this.sendResult(message.command_id, 'scan_result', { devices, errors: errors.slice(0, 10) });
   }
 
   async handleModbusRead(message) {
-    const { register, registerAddress, count = 1, slave_id } = message.params;
-    const regAddr = register || registerAddress || 0;
-    
-    console.log(`📖 Reading ${count} register(s) from address ${regAddr} (Unit ${slave_id || 1})`);
+    const { commandId, params } = message;
 
     try {
-      await this.connectToDevice(message.params);
-      
-      const timeout = message.params.timeout || 3000;
-      const data = await Promise.race([
-        this.modbusClient.readHoldingRegisters(regAddr, count),
-        new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('Modbus read timeout')), timeout)
-        )
-      ]);
-      
-      if (!data || !data.data || !Array.isArray(data.data)) {
-        throw new Error('Invalid Modbus response: no data received');
+      const client = await this.connectToDevice(params);
+      if (!client) {
+        throw new Error('Failed to connect to device');
       }
-      
-      this.sendResult(message.command_id, 'modbus_read_result', {
-        values: data.data,
-        timestamp: new Date().toISOString()
-      });
 
-      console.log(`✅ Read successful: [${data.data.join(', ')}]`);
-    } catch (error) {
-      console.error(`❌ Read failed:`, error.message);
-      throw error;
-    } finally {
-      try {
-        this.modbusClient.close(() => {});
-      } catch (closeError) {
-        console.error(`⚠️  Error closing connection:`, closeError.message);
+      const address = params.registerAddress;
+      const count = params.registerCount || 1;
+      const functionCode = params.functionCode || 3;
+
+      let data;
+      if (functionCode === 1) {
+        data = await client.readCoils(address, count);
+      } else if (functionCode === 2) {
+        data = await client.readDiscreteInputs(address, count);
+      } else if (functionCode === 3) {
+        data = await client.readHoldingRegisters(address, count);
+      } else if (functionCode === 4) {
+        data = await client.readInputRegisters(address, count);
       }
+
+      this.sendResult(commandId, 'modbus_read_result', {
+        address,
+        count,
+        values: data.data,
+      });
+    } catch (error) {
+      this.sendError(commandId, error.message);
     }
   }
 
   async handleModbusWrite(message) {
-    const { register, registerAddress, value, slave_id } = message.params;
-    const regAddr = register || registerAddress || 0;
-    
-    if (value === undefined || value === null) {
-      throw new Error('Value is required for write operation');
-    }
-    
-    console.log(`✍️  Writing value ${value} to register ${regAddr} (Unit ${slave_id || 1})`);
+    const { commandId, params } = message;
 
     try {
-      await this.connectToDevice(message.params);
-      
-      const timeout = message.params.timeout || 3000;
-      await Promise.race([
-        this.modbusClient.writeRegister(regAddr, value),
-        new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('Modbus write timeout')), timeout)
-        )
-      ]);
-      
-      this.sendResult(message.command_id, 'modbus_write_result', {
-        success: true,
-        timestamp: new Date().toISOString()
-      });
-
-      console.log(`✅ Write successful`);
-    } catch (error) {
-      console.error(`❌ Write failed:`, error.message);
-      throw error;
-    } finally {
-      try {
-        this.modbusClient.close(() => {});
-      } catch (closeError) {
-        console.error(`⚠️  Error closing connection:`, closeError.message);
+      const client = await this.connectToDevice(params);
+      if (!client) {
+        throw new Error('Failed to connect to device');
       }
+
+      const address = params.registerAddress;
+      const value = params.value;
+      const functionCode = params.functionCode || 6;
+
+      if (functionCode === 5) {
+        await client.writeCoil(address, value);
+      } else if (functionCode === 6) {
+        await client.writeRegister(address, value);
+      } else if (functionCode === 15) {
+        await client.writeCoils(address, [value]);
+      } else if (functionCode === 16) {
+        await client.writeRegisters(address, [value]);
+      }
+
+      this.sendResult(commandId, 'modbus_write_result', {
+        address,
+        value,
+        success: true,
+      });
+    } catch (error) {
+      this.sendError(commandId, error.message);
     }
   }
 
   async handleTestCommunication(message) {
-    console.log(`🧪 Testing communication...`);
-    const testResults = {
-      connection: false,
-      read: false,
-      latency: null,
-      error: null
-    };
+    const { commandId, params } = message;
 
     try {
-      // Test 1: Connection
-      console.log(`  Step 1/2: Establishing connection...`);
-      await this.connectToDevice(message.params);
-      testResults.connection = true;
-      console.log(`  ✓ Connection established`);
-      
-      // Test 2: Read operation
-      console.log(`  Step 2/2: Testing read operation...`);
-      const startTime = Date.now();
-      const timeout = message.params.timeout || 3000;
-      
-      await Promise.race([
-        this.modbusClient.readHoldingRegisters(0, 1),
-        new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('Test read timeout')), timeout)
-        )
-      ]);
-      
-      const latency = Date.now() - startTime;
-      testResults.read = true;
-      testResults.latency = latency;
-      console.log(`  ✓ Read operation successful`);
-      
-      this.sendResult(message.command_id, 'test_result', {
-        success: true,
-        latency,
-        message: 'Device is responding',
-        details: testResults
-      });
-
-      console.log(`✅ Communication test passed (${latency}ms)`);
-    } catch (error) {
-      testResults.error = error.message;
-      
-      this.sendResult(message.command_id, 'test_result', {
-        success: false,
-        message: error.message,
-        details: testResults
-      });
-      
-      console.log(`❌ Communication test failed: ${error.message}`);
-      console.log(`📊 Test results:`, testResults);
-    } finally {
-      try {
-        this.modbusClient.close(() => {});
-      } catch (closeError) {
-        console.error(`⚠️  Error closing connection:`, closeError.message);
+      const client = await this.connectToDevice(params);
+      if (!client) {
+        throw new Error('Failed to connect to device');
       }
+
+      const pingCount = params.pingCount || 3;
+      const results = [];
+
+      for (let i = 0; i < pingCount; i++) {
+        const startTime = Date.now();
+        try {
+          await client.readHoldingRegisters(0, 1);
+          const responseTime = Date.now() - startTime;
+          results.push({ success: true, responseTime });
+        } catch {
+          results.push({ success: false, responseTime: null });
+        }
+      }
+
+      const successfulPings = results.filter(r => r.success).length;
+      const avgResponseTime = results.filter(r => r.success)
+        .reduce((sum, r) => sum + r.responseTime, 0) / successfulPings;
+
+      this.sendResult(commandId, 'test_result', {
+        success: successfulPings > 0,
+        successRate: (successfulPings / pingCount) * 100,
+        avgResponseTime: avgResponseTime || null,
+        results,
+      });
+    } catch (error) {
+      this.sendError(commandId, error.message);
     }
   }
 
   sendResult(commandId, type, data) {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      console.log(`📤 Sending result: ${type} (command_id: ${commandId})`);
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({
+        commandId,
         type,
-        command_id: commandId,
-        data
+        ...data,
       }));
-    } else {
-      console.error(`❌ Cannot send result: WebSocket not connected (state: ${this.ws?.readyState})`);
     }
   }
 
   sendError(commandId, message) {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      console.log(`📤 Sending error: ${message} (command_id: ${commandId})`);
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({
+        commandId,
         type: 'error',
-        command_id: commandId,
-        error: message
+        error: message,
       }));
-    } else {
-      console.error(`❌ Cannot send error: WebSocket not connected (state: ${this.ws?.readyState})`);
     }
   }
 }
 
-// CLI
+// ============================================================================
+// CLI ENTRY POINT
+// ============================================================================
 program
-  .name('modbus-agent')
-  .description('Modbus Manager Local Agent - Supports TCP & RTU')
-  .version('1.0.0')
+  .version('0.2.0')
+  .description('Modbus Manager Local Agent - High-Performance Polling Engine')
   .requiredOption('-t, --token <token>', 'Agent registration token')
-  .parse();
+  .parse(process.argv);
 
 const options = program.opts();
 const agent = new ModbusAgent(options.token);
 agent.connect();
 
-console.log(`
-╔════════════════════════════════════════╗
-║   Modbus Manager Local Agent          ║
-║   Protocol Support: TCP & RTU         ║
-╚════════════════════════════════════════╝
-`);
+console.log('Modbus Manager Agent v0.2.0 - High-Performance Polling Engine');
+console.log('Press Ctrl+C to stop');
