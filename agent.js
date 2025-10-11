@@ -197,6 +197,22 @@ class PollingScheduler {
 
       const timestamp = new Date().toISOString();
 
+      // Build merged connection params with protocol
+      const connParams = {
+        protocol: device.protocol,
+        ...device.connectionParams
+      };
+      
+      // Safety check for missing protocol
+      if (!connParams.protocol) {
+        console.warn(`[PollingScheduler] Device ${device.deviceId} missing protocol, skipping poll group`);
+        return;
+      }
+
+      const cacheKey = JSON.stringify(connParams);
+      const lastReadTime = this.lastSuccessfulRead.get(device.deviceId);
+      const timeSinceLastRead = lastReadTime ? (Date.now() - lastReadTime) : Infinity;
+
       // Execute optimized reads
       for (const readCmd of optimizedReads) {
         try {
@@ -208,13 +224,9 @@ class PollingScheduler {
             return addr;
           };
 
-          const cacheKey = JSON.stringify(device.connectionParams);
-          const lastReadTime = this.lastSuccessfulRead.get(device.deviceId);
-          const timeSinceLastRead = lastReadTime ? (Date.now() - lastReadTime) : Infinity;
-
           // Check if we need to reconnect (comprehensive socket state check)
           let needsReconnect = false;
-          if (device.connectionParams?.protocol === 'tcp' && client) {
+          if (connParams.protocol === 'tcp' && client) {
             const sock = client._client;
             const isDestroyed = sock?.destroyed === true;
             const isNotWritable = sock && !sock.writable;
@@ -231,7 +243,7 @@ class PollingScheduler {
           if (needsReconnect || !client) {
             this.agent.deviceConnections.delete(cacheKey);
             console.log(`[PollingScheduler] Establishing fresh connection before read...`);
-            client = await this.agent.connectToDevice(device.connectionParams);
+            client = await this.agent.connectToDevice(connParams);
           }
 
           const start = normalize(readCmd.startAddress);
@@ -279,10 +291,9 @@ class PollingScheduler {
           const isConnErr = /Port Not Open|ECONN|EPIPE|reset|closed|socket|Timeout/i.test(readError.message || '');
           if (isConnErr) {
             console.log('[PollingScheduler] Connection error detected, clearing cache and forcing fresh connection...');
-            const cacheKey = JSON.stringify(device.connectionParams);
             this.agent.deviceConnections.delete(cacheKey);
             try {
-              client = await this.agent.connectToDevice(device.connectionParams);
+              client = await this.agent.connectToDevice(connParams);
               const retryStart = (function(addr){
                 if (addr >= 40001 && addr <= 49999) return addr - 40001;
                 if (addr >= 30001 && addr <= 39999) return addr - 30001;
@@ -614,6 +625,19 @@ class ModbusAgent {
   }
 
   async connectToDevice(params, retries = 3) {
+    // Infer protocol if missing
+    if (!params.protocol) {
+      if (params.deviceIp || params.ip) {
+        params.protocol = 'tcp';
+        console.log(`[Connection] Inferred protocol: tcp from IP address`);
+      } else if (params.serialPort) {
+        params.protocol = 'rtu';
+        console.log(`[Connection] Inferred protocol: rtu from serial port`);
+      } else {
+        throw new Error('Missing protocol in connection params and cannot infer from params');
+      }
+    }
+
     const cacheKey = JSON.stringify(params);
     
     // Return cached connection if available and still open
@@ -677,6 +701,8 @@ class ModbusAgent {
           client.setTimeout(10000);
           
           console.log(`[Connection] ✓ Successfully connected to ${params.serialPort}`);
+        } else {
+          throw new Error(`Unknown protocol: ${params.protocol}`);
         }
 
         this.deviceConnections.set(cacheKey, client);
