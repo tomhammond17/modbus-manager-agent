@@ -222,9 +222,6 @@ class PollingScheduler {
             const value = data.data[index];
             const hasChanged = this.agent.valueCache.updateValue(device.deviceId, register.registerId, value);
 
-            const value = data.data[index];
-            const hasChanged = this.agent.valueCache.updateValue(device.deviceId, register.registerId, value);
-
             // Add to historical buffer (all data)
             this.agent.historicalBuffer.addDataPoint(
               device.deviceId,
