@@ -563,11 +563,15 @@ class ModbusAgent {
     // Return cached connection if available and still open
     if (this.deviceConnections.has(cacheKey)) {
       const cachedClient = this.deviceConnections.get(cacheKey);
-      if (cachedClient && cachedClient.isOpen) {
+      // Check if port is actually open (modbus-serial specific)
+      const isOpen = cachedClient?._port?.isOpen || false;
+      if (cachedClient && isOpen) {
+        console.log(`[Connection] Using cached connection`);
         return cachedClient;
       }
       // Remove stale connection
       this.deviceConnections.delete(cacheKey);
+      console.log(`[Connection] Cleared stale cached connection`);
     }
 
     const client = new ModbusRTU();
