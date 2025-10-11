@@ -262,6 +262,7 @@ class ModbusAgent {
     this.heartbeatInterval = null;
     this.batchTransmitInterval = null;
     this.historicalUploadInterval = null;
+    this.configCheckInterval = null;
     this.deviceConnections = new Map(); // Cache Modbus connections
 
     // Polling engine components
@@ -273,6 +274,7 @@ class ModbusAgent {
     // Configuration
     this.batchWindow = 2000; // 2 seconds
     this.historicalBatchInterval = 60000; // 1 minute
+    this.configCheckIntervalMs = 120000; // 2 minutes
   }
 
   connect() {
@@ -288,6 +290,7 @@ class ModbusAgent {
       this.startHeartbeat();
       this.startBatchTransmit();
       this.startHistoricalUpload();
+      this.startConfigCheck();
     });
 
     this.ws.on('message', (data) => {
@@ -314,6 +317,7 @@ class ModbusAgent {
       this.stopHeartbeat();
       this.stopBatchTransmit();
       this.stopHistoricalUpload();
+      this.stopConfigCheck();
       this.scheduleReconnect();
     });
 
@@ -360,6 +364,22 @@ class ModbusAgent {
     if (this.historicalUploadInterval) {
       clearInterval(this.historicalUploadInterval);
       this.historicalUploadInterval = null;
+    }
+  }
+
+  startConfigCheck() {
+    // Check for config updates every 2 minutes
+    this.configCheckInterval = setInterval(() => {
+      this.fetchAndApplyActiveConfig();
+    }, this.configCheckIntervalMs);
+    console.log(`[ConfigCheck] Started periodic config check every ${this.configCheckIntervalMs / 1000}s`);
+  }
+
+  stopConfigCheck() {
+    if (this.configCheckInterval) {
+      clearInterval(this.configCheckInterval);
+      this.configCheckInterval = null;
+      console.log('[ConfigCheck] Stopped periodic config check');
     }
   }
 
@@ -712,13 +732,30 @@ class ModbusAgent {
       });
       const result = await resp.json();
       if (result?.hasConfig && result.config?.polling_config) {
-        console.log('[Bootstrap] Applying active polling configuration from cloud');
-        await this.handleSetPollingConfig({ commandId: 'bootstrap', params: result.config.polling_config });
+        const configId = result.config.id;
+        const configName = result.config.config_name;
+        
+        // Check if this is a new config or an update
+        const isNewConfig = !this.currentConfigId || this.currentConfigId !== configId;
+        
+        if (isNewConfig) {
+          console.log(`[ConfigCheck] New configuration detected: ${configName} (${configId})`);
+          this.currentConfigId = configId;
+          await this.handleSetPollingConfig({ commandId: 'config-update', params: result.config.polling_config });
+        } else {
+          console.log(`[ConfigCheck] Configuration unchanged: ${configName}`);
+        }
       } else {
-        console.log('[Bootstrap] No active polling configuration assigned to this agent');
+        if (this.currentConfigId) {
+          console.log('[ConfigCheck] Active config removed - stopping polling');
+          this.pollingScheduler.stopPolling();
+          this.currentConfigId = null;
+        } else {
+          console.log('[ConfigCheck] No active polling configuration assigned to this agent');
+        }
       }
     } catch (e) {
-      console.error('[Bootstrap] Failed to fetch active config:', e.message);
+      console.error('[ConfigCheck] Failed to fetch active config:', e.message);
     }
   }
 }
