@@ -231,10 +231,9 @@ class PollingScheduler {
             const isDestroyed = sock?.destroyed === true;
             const isNotWritable = sock && !sock.writable;
             const isStale = timeSinceLastRead > 5000; // 5 seconds since last successful read
-            const clientNotOpen = client.isOpen && !client.isOpen();
             
-            if (isDestroyed || isNotWritable || isStale || clientNotOpen) {
-              console.log(`[PollingScheduler] Connection needs refresh: destroyed=${isDestroyed}, notWritable=${isNotWritable}, stale=${isStale}, notOpen=${clientNotOpen}`);
+            if (isDestroyed || isNotWritable || isStale) {
+              console.log(`[PollingScheduler] Connection needs refresh: destroyed=${isDestroyed}, notWritable=${isNotWritable}, stale=${isStale}`);
               needsReconnect = true;
             }
           }
