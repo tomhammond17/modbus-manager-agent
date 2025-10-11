@@ -528,37 +528,65 @@ class ModbusAgent {
     }
   }
 
-  async connectToDevice(params) {
+  async connectToDevice(params, retries = 3) {
     const cacheKey = JSON.stringify(params);
     
-    // Return cached connection if available
+    // Return cached connection if available and still open
     if (this.deviceConnections.has(cacheKey)) {
-      return this.deviceConnections.get(cacheKey);
+      const cachedClient = this.deviceConnections.get(cacheKey);
+      if (cachedClient && cachedClient.isOpen) {
+        return cachedClient;
+      }
+      // Remove stale connection
+      this.deviceConnections.delete(cacheKey);
     }
 
     const client = new ModbusRTU();
+    let lastError;
 
-    try {
-      if (params.protocol === 'tcp') {
-        await client.connectTCP(params.deviceIp || params.ip, { port: params.port || 502 });
-        client.setID(params.unitId || 1);
-      } else if (params.protocol === 'rtu') {
-        await client.connectRTUBuffered(params.serialPort, {
-          baudRate: params.baudRate || 9600,
-          parity: params.parity || 'none',
-          dataBits: params.dataBits || 8,
-          stopBits: params.stopBits || 1,
-        });
-        client.setID(params.unitId || 1);
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      try {
+        if (params.protocol === 'tcp') {
+          const ip = params.deviceIp || params.ip;
+          const port = params.port || 502;
+          console.log(`[Connection] Attempt ${attempt}/${retries} - Connecting to ${ip}:${port}`);
+          
+          await client.connectTCP(ip, { port });
+          client.setID(params.unitId || 1);
+          client.setTimeout(10000); // 10 second timeout
+          
+          console.log(`[Connection] ✓ Successfully connected to ${ip}:${port}`);
+        } else if (params.protocol === 'rtu') {
+          console.log(`[Connection] Attempt ${attempt}/${retries} - Connecting to ${params.serialPort}`);
+          
+          await client.connectRTUBuffered(params.serialPort, {
+            baudRate: params.baudRate || 9600,
+            parity: params.parity || 'none',
+            dataBits: params.dataBits || 8,
+            stopBits: params.stopBits || 1,
+          });
+          client.setID(params.unitId || 1);
+          client.setTimeout(10000);
+          
+          console.log(`[Connection] ✓ Successfully connected to ${params.serialPort}`);
+        }
+
+        this.deviceConnections.set(cacheKey, client);
+        return client;
+      } catch (error) {
+        lastError = error;
+        console.error(`[Connection] ✗ Attempt ${attempt}/${retries} failed:`, error.message);
+        
+        if (attempt < retries) {
+          console.log(`[Connection] Retrying in 2 seconds...`);
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        }
       }
-
-      client.setTimeout(5000);
-      this.deviceConnections.set(cacheKey, client);
-      return client;
-    } catch (error) {
-      console.error('Device connection error:', error.message);
-      return null;
     }
+
+    const errorMsg = `Failed to connect after ${retries} attempts: ${lastError?.message || 'Unknown error'}`;
+    console.error(`[Connection] ${errorMsg}`);
+    throw new Error(errorMsg);
   }
 
   async handleNetworkScan(message) {
