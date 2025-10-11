@@ -150,6 +150,7 @@ class PollingScheduler {
     this.agent = agent;
     this.timers = new Map(); // key: groupId, value: interval handle
     this.config = null;
+    this.lastSuccessfulRead = new Map(); // Track last successful read timestamp per device
   }
 
   startPolling(config) {
@@ -207,15 +208,37 @@ class PollingScheduler {
             return addr;
           };
 
-          // Ensure TCP socket is open; reconnect if needed
-          if (device.connectionParams?.protocol === 'tcp' && client?._client?.destroyed) {
-            const cacheKey = JSON.stringify(device.connectionParams);
+          const cacheKey = JSON.stringify(device.connectionParams);
+          const lastReadTime = this.lastSuccessfulRead.get(device.deviceId);
+          const timeSinceLastRead = lastReadTime ? (Date.now() - lastReadTime) : Infinity;
+
+          // Check if we need to reconnect (comprehensive socket state check)
+          let needsReconnect = false;
+          if (device.connectionParams?.protocol === 'tcp' && client) {
+            const sock = client._client;
+            const isDestroyed = sock?.destroyed === true;
+            const isNotWritable = sock && !sock.writable;
+            const isStale = timeSinceLastRead > 5000; // 5 seconds since last successful read
+            const clientNotOpen = client.isOpen && !client.isOpen();
+            
+            if (isDestroyed || isNotWritable || isStale || clientNotOpen) {
+              console.log(`[PollingScheduler] Connection needs refresh: destroyed=${isDestroyed}, notWritable=${isNotWritable}, stale=${isStale}, notOpen=${clientNotOpen}`);
+              needsReconnect = true;
+            }
+          }
+
+          // Reconnect if needed
+          if (needsReconnect || !client) {
             this.agent.deviceConnections.delete(cacheKey);
+            console.log(`[PollingScheduler] Establishing fresh connection before read...`);
             client = await this.agent.connectToDevice(device.connectionParams);
           }
 
           const start = normalize(readCmd.startAddress);
           const data = await client.readHoldingRegisters(start, readCmd.count);
+          
+          // Track successful read
+          this.lastSuccessfulRead.set(device.deviceId, Date.now());
           
           // Process each register value
           readCmd.registers.forEach((register, index) => {
@@ -242,10 +265,20 @@ class PollingScheduler {
             }
           });
         } catch (readError) {
+          // Enhanced error logging with socket state diagnostics
+          const sock = client?._client;
+          const sockState = sock ? {
+            destroyed: sock.destroyed,
+            writable: sock.writable,
+            readyState: sock.readyState,
+            connecting: sock.connecting
+          } : 'no socket';
           console.error(`[PollingScheduler] Error reading ${readCmd.startAddress}-${readCmd.startAddress + readCmd.count - 1}: ${readError.message} (code: ${readError.code || 'n/a'})`);
+          console.error(`[PollingScheduler] Socket state at error:`, sockState);
+          
           const isConnErr = /Port Not Open|ECONN|EPIPE|reset|closed|socket|Timeout/i.test(readError.message || '');
           if (isConnErr) {
-            console.log('[PollingScheduler] Connection error detected, clearing cache and retrying once...');
+            console.log('[PollingScheduler] Connection error detected, clearing cache and forcing fresh connection...');
             const cacheKey = JSON.stringify(device.connectionParams);
             this.agent.deviceConnections.delete(cacheKey);
             try {
@@ -620,10 +653,11 @@ class ModbusAgent {
           client.setID(params.unitId || 1);
           client.setTimeout(10000); // 10 second timeout
           
-          // Attach socket diagnostics (TCP only)
+          // Attach socket diagnostics and enable keep-alive (TCP only)
           const sock = client?._client;
           if (sock && !sock._agentMonitored) {
             sock._agentMonitored = true;
+            sock.setKeepAlive(true, 1000); // Enable keep-alive to prevent idle timeout
             sock.on('error', (e) => console.error(`[TCP] Socket error ${ip}:${port} - ${e.code || e.message}`));
             sock.on('close', (hadErr) => console.warn(`[TCP] Socket closed ${ip}:${port}, hadError=${hadErr}`));
             sock.on('end', () => console.warn(`[TCP] Socket ended ${ip}:${port}`));
