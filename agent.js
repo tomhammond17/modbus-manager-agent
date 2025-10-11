@@ -519,16 +519,24 @@ class ModbusAgent {
         }),
       });
 
-      const result = await response.json();
-      
-      if (result.success) {
-        console.log(`[HistoricalUpload] Successfully uploaded ${result.inserted} records`);
-        this.historicalBuffer.clearBuffer();
+      if (response.ok) {
+        const result = await response.json();
+        if (result.success) {
+          console.log(`[HistoricalUpload] Successfully uploaded ${result.inserted} records`);
+          this.historicalBuffer.clearBuffer();
+        } else {
+          console.error('[HistoricalUpload] Upload failed:', result.error || result.errors);
+        }
       } else {
-        console.error('[HistoricalUpload] Upload failed:', result.error || result.errors);
+        const errorText = await response.text();
+        console.error(`[HistoricalUpload] Upload failed (${response.status} ${response.statusText}):`, errorText);
       }
     } catch (error) {
-      console.error('[HistoricalUpload] Error uploading historical data:', error.message);
+      console.error('[HistoricalUpload] Error uploading historical data:', {
+        message: error.message,
+        stack: error.stack,
+        error: error
+      });
     }
   }
 
