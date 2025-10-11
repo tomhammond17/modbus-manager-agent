@@ -298,6 +298,8 @@ class ModbusAgent {
         if (message.type === 'connected' && message.agentId) {
           this.agentId = message.agentId;
           console.log(`✓ Agent ID set: ${this.agentId}`);
+          // Auto-fetch active polling config for this agent
+          this.fetchAndApplyActiveConfig();
           return;
         }
         
@@ -697,6 +699,26 @@ class ModbusAgent {
         type: 'error',
         error: message,
       }));
+    }
+  }
+
+  async fetchAndApplyActiveConfig() {
+    try {
+      const resp = await fetch('https://ckdjiovqshugcprabpty.supabase.co/functions/v1/get-active-config', {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${this.token}`,
+        },
+      });
+      const result = await resp.json();
+      if (result?.hasConfig && result.config?.polling_config) {
+        console.log('[Bootstrap] Applying active polling configuration from cloud');
+        await this.handleSetPollingConfig({ commandId: 'bootstrap', params: result.config.polling_config });
+      } else {
+        console.log('[Bootstrap] No active polling configuration assigned to this agent');
+      }
+    } catch (e) {
+      console.error('[Bootstrap] Failed to fetch active config:', e.message);
     }
   }
 }
