@@ -563,15 +563,24 @@ class ModbusAgent {
     // Return cached connection if available and still open
     if (this.deviceConnections.has(cacheKey)) {
       const cachedClient = this.deviceConnections.get(cacheKey);
-      // Check if port is actually open (modbus-serial specific)
-      const isOpen = cachedClient?._port?.isOpen || false;
+      
+      // Different connection checks for TCP vs RTU
+      let isOpen = false;
+      if (params.protocol === 'tcp') {
+        // For TCP: check if socket exists and is not destroyed
+        isOpen = cachedClient?._client?.destroyed === false;
+      } else {
+        // For RTU: check serial port isOpen property
+        isOpen = cachedClient?._port?.isOpen || false;
+      }
+      
       if (cachedClient && isOpen) {
-        console.log(`[Connection] Using cached connection`);
+        console.log(`[Connection] Using cached ${params.protocol.toUpperCase()} connection`);
         return cachedClient;
       }
       // Remove stale connection
       this.deviceConnections.delete(cacheKey);
-      console.log(`[Connection] Cleared stale cached connection`);
+      console.log(`[Connection] Cleared stale cached ${params.protocol} connection`);
     }
 
     const client = new ModbusRTU();
