@@ -173,10 +173,31 @@ class PollingScheduler {
     try {
       console.log(`[PollingScheduler] Polling group ${group.groupId} on device ${device.deviceId}`);
 
-      // Connect to device if not already connected
-      const client = await this.agent.connectToDevice(device.connectionParams);
-      if (!client) {
-        console.error(`[PollingScheduler] Failed to connect to device ${device.deviceId}`);
+      // Connect to device with connection verification
+      let client;
+      try {
+        client = await this.agent.connectToDevice(device.connectionParams);
+        if (!client) {
+          throw new Error('Failed to get Modbus client');
+        }
+        
+        // Verify connection is actually open before attempting reads
+        if (!client.isOpen) {
+          console.log('[PollingScheduler] Connection not open, clearing cache and reconnecting...');
+          const cacheKey = JSON.stringify(device.connectionParams);
+          this.agent.deviceConnections.delete(cacheKey);
+          client = await this.agent.connectToDevice(device.connectionParams);
+          
+          if (!client || !client.isOpen) {
+            throw new Error('Device connection not open after reconnection attempt');
+          }
+        }
+      } catch (connError) {
+        console.error(`[PollingScheduler] Connection error for device ${device.deviceId}:`, connError.message);
+        const timestamp = new Date().toISOString();
+        group.registers.forEach(register => {
+          this.agent.historicalBuffer.addDataPoint(device.deviceId, register.registerId, null, timestamp, 'bad');
+        });
         return;
       }
 
@@ -217,6 +238,13 @@ class PollingScheduler {
           });
         } catch (readError) {
           console.error(`[PollingScheduler] Error reading registers ${readCmd.startAddress}-${readCmd.startAddress + readCmd.count - 1}:`, readError.message);
+          
+          // If connection-related error, clear the cached connection
+          if (readError.message.includes('Port Not Open') || readError.message.includes('Connection')) {
+            console.log('[PollingScheduler] Clearing cached connection due to connection error');
+            const cacheKey = JSON.stringify(device.connectionParams);
+            this.agent.deviceConnections.delete(cacheKey);
+          }
           
           // Mark registers as bad quality in historical buffer
           readCmd.registers.forEach(register => {
