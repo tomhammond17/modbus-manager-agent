@@ -457,6 +457,11 @@ class ModbusAgent {
           await this.handleTestCommunication({ command, commandId, params });
           break;
 
+        case 'heartbeat_ack':
+          // Heartbeat acknowledgment - no action needed
+          console.log('[Heartbeat] Received acknowledgment from server');
+          break;
+
         default:
           console.log(`Unknown command: ${command}`);
       }
