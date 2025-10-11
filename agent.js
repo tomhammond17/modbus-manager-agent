@@ -211,7 +211,6 @@ class PollingScheduler {
 
       const cacheKey = JSON.stringify(connParams);
       const lastReadTime = this.lastSuccessfulRead.get(device.deviceId);
-      const timeSinceLastRead = lastReadTime ? (Date.now() - lastReadTime) : Infinity;
 
       // Execute optimized reads
       for (const readCmd of optimizedReads) {
@@ -224,16 +223,15 @@ class PollingScheduler {
             return addr;
           };
 
-          // Check if we need to reconnect (comprehensive socket state check)
+          // Check if we need to reconnect (socket health check only)
           let needsReconnect = false;
           if (connParams.protocol === 'tcp' && client) {
             const sock = client._client;
             const isDestroyed = sock?.destroyed === true;
             const isNotWritable = sock && !sock.writable;
-            const isStale = timeSinceLastRead > 5000; // 5 seconds since last successful read
             
-            if (isDestroyed || isNotWritable || isStale) {
-              console.log(`[PollingScheduler] Connection needs refresh: destroyed=${isDestroyed}, notWritable=${isNotWritable}, stale=${isStale}`);
+            if (isDestroyed || isNotWritable) {
+              console.log(`[PollingScheduler] Connection needs refresh: destroyed=${isDestroyed}, notWritable=${isNotWritable}`);
               needsReconnect = true;
             }
           }
