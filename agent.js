@@ -293,6 +293,14 @@ class ModbusAgent {
     this.ws.on('message', (data) => {
       try {
         const message = JSON.parse(data.toString());
+        
+        // Handle welcome/connected message
+        if (message.type === 'connected' && message.agentId) {
+          this.agentId = message.agentId;
+          console.log(`✓ Agent ID set: ${this.agentId}`);
+          return;
+        }
+        
         this.handleCommand(message);
       } catch (error) {
         console.error('Error parsing message:', error.message);
@@ -420,30 +428,33 @@ class ModbusAgent {
   }
 
   async handleCommand(message) {
-    const { command, commandId, params } = message;
+    // Support both camelCase and snake_case for backward compatibility
+    const command = message.command || message.type;
+    const commandId = message.commandId || message.command_id;
+    const params = message.params || {};
     
-    console.log(`Received command: ${command}`, params);
+    console.log(`Received command: ${command}`, commandId);
 
     try {
       switch (command) {
         case 'set_polling_config':
-          await this.handleSetPollingConfig(message);
+          await this.handleSetPollingConfig({ command, commandId, params });
           break;
 
         case 'network_scan':
-          await this.handleNetworkScan(message);
+          await this.handleNetworkScan({ command, commandId, params });
           break;
 
         case 'modbus_read':
-          await this.handleModbusRead(message);
+          await this.handleModbusRead({ command, commandId, params });
           break;
 
         case 'modbus_write':
-          await this.handleModbusWrite(message);
+          await this.handleModbusWrite({ command, commandId, params });
           break;
 
         case 'test_communication':
-          await this.handleTestCommunication(message);
+          await this.handleTestCommunication({ command, commandId, params });
           break;
 
         default:
