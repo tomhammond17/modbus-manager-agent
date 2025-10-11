@@ -173,24 +173,12 @@ class PollingScheduler {
     try {
       console.log(`[PollingScheduler] Polling group ${group.groupId} on device ${device.deviceId}`);
 
-      // Connect to device with connection verification
+      // Connect to device
       let client;
       try {
         client = await this.agent.connectToDevice(device.connectionParams);
         if (!client) {
           throw new Error('Failed to get Modbus client');
-        }
-        
-        // Verify connection is actually open before attempting reads
-        if (!client.isOpen) {
-          console.log('[PollingScheduler] Connection not open, clearing cache and reconnecting...');
-          const cacheKey = JSON.stringify(device.connectionParams);
-          this.agent.deviceConnections.delete(cacheKey);
-          client = await this.agent.connectToDevice(device.connectionParams);
-          
-          if (!client || !client.isOpen) {
-            throw new Error('Device connection not open after reconnection attempt');
-          }
         }
       } catch (connError) {
         console.error(`[PollingScheduler] Connection error for device ${device.deviceId}:`, connError.message);
@@ -238,14 +226,27 @@ class PollingScheduler {
           });
         } catch (readError) {
           console.error(`[PollingScheduler] Error reading registers ${readCmd.startAddress}-${readCmd.startAddress + readCmd.count - 1}:`, readError.message);
-          
-          // If connection-related error, clear the cached connection
-          if (readError.message.includes('Port Not Open') || readError.message.includes('Connection')) {
-            console.log('[PollingScheduler] Clearing cached connection due to connection error');
+          const isConnErr = /Port Not Open|ECONN|EPIPE|reset|closed|socket|Timeout/i.test(readError.message || '');
+          if (isConnErr) {
+            console.log('[PollingScheduler] Connection error detected, clearing cache and retrying once...');
             const cacheKey = JSON.stringify(device.connectionParams);
             this.agent.deviceConnections.delete(cacheKey);
+            try {
+              client = await this.agent.connectToDevice(device.connectionParams);
+              const retryData = await client.readHoldingRegisters(readCmd.startAddress, readCmd.count);
+              readCmd.registers.forEach((register, index) => {
+                const value = retryData.data[index];
+                const hasChanged = this.agent.valueCache.updateValue(device.deviceId, register.registerId, value);
+                this.agent.historicalBuffer.addDataPoint(device.deviceId, register.registerId, value, timestamp, 'good');
+                if (hasChanged || this.agent.transmitBuffer.shouldSendFullRefresh()) {
+                  this.agent.transmitBuffer.queueChange(device.deviceId, register.registerId, value, timestamp);
+                }
+              });
+              continue;
+            } catch (retryErr) {
+              console.error('[PollingScheduler] Retry failed:', retryErr.message);
+            }
           }
-          
           // Mark registers as bad quality in historical buffer
           readCmd.registers.forEach(register => {
             this.agent.historicalBuffer.addDataPoint(
