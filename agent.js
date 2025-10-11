@@ -199,10 +199,29 @@ class PollingScheduler {
       // Execute optimized reads
       for (const readCmd of optimizedReads) {
         try {
-          const data = await client.readHoldingRegisters(readCmd.startAddress, readCmd.count);
+          // Normalize Modbus register address (support 40001/30001 style maps)
+          const normalize = (addr) => {
+            if (addr >= 40001 && addr <= 49999) return addr - 40001; // Holding Registers (FC3)
+            if (addr >= 30001 && addr <= 39999) return addr - 30001; // Input Registers (FC4)
+            if (addr > 0) return addr - 1; // 1-based to 0-based fallback
+            return addr;
+          };
+
+          // Ensure TCP socket is open; reconnect if needed
+          if (device.connectionParams?.protocol === 'tcp' && client?._client?.destroyed) {
+            const cacheKey = JSON.stringify(device.connectionParams);
+            this.agent.deviceConnections.delete(cacheKey);
+            client = await this.agent.connectToDevice(device.connectionParams);
+          }
+
+          const start = normalize(readCmd.startAddress);
+          const data = await client.readHoldingRegisters(start, readCmd.count);
           
           // Process each register value
           readCmd.registers.forEach((register, index) => {
+            const value = data.data[index];
+            const hasChanged = this.agent.valueCache.updateValue(device.deviceId, register.registerId, value);
+
             const value = data.data[index];
             const hasChanged = this.agent.valueCache.updateValue(device.deviceId, register.registerId, value);
 
@@ -234,7 +253,13 @@ class PollingScheduler {
             this.agent.deviceConnections.delete(cacheKey);
             try {
               client = await this.agent.connectToDevice(device.connectionParams);
-              const retryData = await client.readHoldingRegisters(readCmd.startAddress, readCmd.count);
+              const retryStart = (function(addr){
+                if (addr >= 40001 && addr <= 49999) return addr - 40001;
+                if (addr >= 30001 && addr <= 39999) return addr - 30001;
+                if (addr > 0) return addr - 1; 
+                return addr;
+              })(readCmd.startAddress);
+              const retryData = await client.readHoldingRegisters(retryStart, readCmd.count);
               readCmd.registers.forEach((register, index) => {
                 const value = retryData.data[index];
                 const hasChanged = this.agent.valueCache.updateValue(device.deviceId, register.registerId, value);
@@ -709,14 +734,21 @@ class ModbusAgent {
       const functionCode = params.functionCode || 3;
 
       let data;
+      const normalize = (addr) => {
+        if (addr >= 40001 && addr <= 49999) return addr - 40001;
+        if (addr >= 30001 && addr <= 39999) return addr - 30001;
+        if (addr > 0) return addr - 1;
+        return addr;
+      };
+      const start = normalize(address);
       if (functionCode === 1) {
-        data = await client.readCoils(address, count);
+        data = await client.readCoils(start, count);
       } else if (functionCode === 2) {
-        data = await client.readDiscreteInputs(address, count);
+        data = await client.readDiscreteInputs(start, count);
       } else if (functionCode === 3) {
-        data = await client.readHoldingRegisters(address, count);
+        data = await client.readHoldingRegisters(start, count);
       } else if (functionCode === 4) {
-        data = await client.readInputRegisters(address, count);
+        data = await client.readInputRegisters(start, count);
       }
 
       this.sendResult(commandId, 'modbus_read_result', {
