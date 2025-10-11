@@ -366,7 +366,7 @@ class ModbusAgent {
 
     // Configuration
     this.batchWindow = 2000; // 2 seconds
-    this.historicalBatchInterval = 60000; // 1 minute
+    this.historicalBatchInterval = 5000; // 5 seconds (for testing)
     this.configCheckIntervalMs = 120000; // 2 minutes
   }
 
