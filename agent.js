@@ -276,15 +276,12 @@ class ModbusAgent {
   }
 
   connect() {
-    const wsUrl = `wss://ckdjiovqshugcprabpty.supabase.co/functions/v1/agent-websocket`;
+    const wsUrl = `wss://ckdjiovqshugcprabpty.functions.supabase.co/agent-websocket?token=${this.token}`;
     
     console.log('Connecting to Modbus Manager...');
+    console.log('WebSocket URL:', wsUrl);
     
-    this.ws = new WebSocket(wsUrl, {
-      headers: {
-        'Authorization': `Bearer ${this.token}`
-      }
-    });
+    this.ws = new WebSocket(wsUrl);
 
     this.ws.on('open', () => {
       console.log('✓ Connected to Modbus Manager');
