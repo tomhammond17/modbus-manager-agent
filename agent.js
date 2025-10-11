@@ -731,6 +731,7 @@ class ModbusAgent {
         },
       });
       const result = await resp.json();
+      console.log('[ConfigCheck] API response:', JSON.stringify(result, null, 2));
       if (result?.hasConfig && result.config?.polling_config) {
         const configId = result.config.id;
         const configName = result.config.config_name;
