@@ -1,6 +1,6 @@
 {
   "name": "@thammond17/modbus-manager-agent",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Local agent for connecting Modbus devices to Modbus Manager cloud platform",
   "main": "agent.js",
   "bin": {
