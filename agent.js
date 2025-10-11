@@ -2,6 +2,7 @@
 
 const WebSocket = require('ws');
 const ModbusRTU = require('modbus-serial');
+const net = require('net');
 const { program } = require('commander');
 
 // ============================================================================
@@ -181,7 +182,7 @@ class PollingScheduler {
           throw new Error('Failed to get Modbus client');
         }
       } catch (connError) {
-        console.error(`[PollingScheduler] Connection error for device ${device.deviceId}:`, connError.message);
+        console.error(`[PollingScheduler] Connection error for device ${device.deviceId}: ${connError.message} (code: ${connError.code || 'n/a'})`);
         const timestamp = new Date().toISOString();
         group.registers.forEach(register => {
           this.agent.historicalBuffer.addDataPoint(device.deviceId, register.registerId, null, timestamp, 'bad');
@@ -225,7 +226,7 @@ class PollingScheduler {
             }
           });
         } catch (readError) {
-          console.error(`[PollingScheduler] Error reading registers ${readCmd.startAddress}-${readCmd.startAddress + readCmd.count - 1}:`, readError.message);
+          console.error(`[PollingScheduler] Error reading ${readCmd.startAddress}-${readCmd.startAddress + readCmd.count - 1}: ${readError.message} (code: ${readError.code || 'n/a'})`);
           const isConnErr = /Port Not Open|ECONN|EPIPE|reset|closed|socket|Timeout/i.test(readError.message || '');
           if (isConnErr) {
             console.log('[PollingScheduler] Connection error detected, clearing cache and retrying once...');
@@ -597,6 +598,15 @@ class ModbusAgent {
           client.setID(params.unitId || 1);
           client.setTimeout(10000); // 10 second timeout
           
+          // Attach socket diagnostics (TCP only)
+          const sock = client?._client;
+          if (sock && !sock._agentMonitored) {
+            sock._agentMonitored = true;
+            sock.on('error', (e) => console.error(`[TCP] Socket error ${ip}:${port} - ${e.code || e.message}`));
+            sock.on('close', (hadErr) => console.warn(`[TCP] Socket closed ${ip}:${port}, hadError=${hadErr}`));
+            sock.on('end', () => console.warn(`[TCP] Socket ended ${ip}:${port}`));
+          }
+
           console.log(`[Connection] ✓ Successfully connected to ${ip}:${port}`);
         } else if (params.protocol === 'rtu') {
           console.log(`[Connection] Attempt ${attempt}/${retries} - Connecting to ${params.serialPort}`);
@@ -617,8 +627,26 @@ class ModbusAgent {
         return client;
       } catch (error) {
         lastError = error;
-        console.error(`[Connection] ✗ Attempt ${attempt}/${retries} failed:`, error.message);
+        console.error(`[Connection] ✗ Attempt ${attempt}/${retries} failed: ${error.message} (code: ${error.code || 'n/a'})`);
         
+        // TCP reachability probe for diagnostics
+        if (params.protocol === 'tcp') {
+          const ip = params.deviceIp || params.ip;
+          const port = params.port || 502;
+          await new Promise((resolve) => {
+            try {
+              const probe = new net.Socket();
+              let outcome = 'unknown';
+              probe.setTimeout(2000);
+              probe.once('connect', () => { outcome = 'connect'; probe.destroy(); });
+              probe.once('timeout', () => { outcome = 'timeout'; probe.destroy(); });
+              probe.once('error', (e) => { outcome = `error:${e.code || e.message}`; });
+              probe.once('close', () => { console.log(`[Connection][Diag] Probe ${ip}:${port} -> ${outcome}`); resolve(null); });
+              probe.connect(port, ip);
+            } catch (_) { resolve(null); }
+          });
+        }
+
         if (attempt < retries) {
           console.log(`[Connection] Retrying in 2 seconds...`);
           await new Promise(resolve => setTimeout(resolve, 2000));
