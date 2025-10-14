@@ -348,7 +348,9 @@ class PollingScheduler {
 // ============================================================================
 class ModbusAgent {
   constructor(token) {
-    this.token = token;
+    this.registrationToken = token;
+    this.jwt = null;
+    this.jwtExpiry = null;
     this.ws = null;
     this.agentId = null;
     this.reconnectTimeout = null;
@@ -356,6 +358,7 @@ class ModbusAgent {
     this.batchTransmitInterval = null;
     this.historicalUploadInterval = null;
     this.configCheckInterval = null;
+    this.jwtRefreshInterval = null;
     this.deviceConnections = new Map(); // Cache Modbus connections
 
     // Polling engine components
@@ -370,8 +373,13 @@ class ModbusAgent {
     this.configCheckIntervalMs = 120000; // 2 minutes
   }
 
-  connect() {
-    const wsUrl = `wss://ckdjiovqshugcprabpty.functions.supabase.co/agent-websocket?token=${this.token}`;
+  async connect() {
+    // Exchange registration token for JWT if we don't have a valid one
+    if (!this.jwt || this.isJwtExpiringSoon()) {
+      await this.refreshJwt();
+    }
+
+    const wsUrl = `wss://ckdjiovqshugcprabpty.functions.supabase.co/agent-websocket?token=${this.jwt}`;
     
     console.log('Connecting to Modbus Manager...');
     console.log('WebSocket URL:', wsUrl);
@@ -380,10 +388,11 @@ class ModbusAgent {
 
     this.ws.on('open', () => {
       console.log('✓ Connected to Modbus Manager');
-      this.startHeartbeat();
-      this.startBatchTransmit();
-      this.startHistoricalUpload();
-      this.startConfigCheck();
+        this.startHeartbeat();
+        this.startBatchTransmit();
+        this.startHistoricalUpload();
+        this.startConfigCheck();
+        this.startJwtRefresh();
     });
 
     this.ws.on('message', (data) => {
@@ -411,6 +420,7 @@ class ModbusAgent {
       this.stopBatchTransmit();
       this.stopHistoricalUpload();
       this.stopConfigCheck();
+      this.stopJwtRefresh();
       this.scheduleReconnect();
     });
 
@@ -432,6 +442,68 @@ class ModbusAgent {
       clearInterval(this.heartbeatInterval);
       this.heartbeatInterval = null;
     }
+  }
+
+  startJwtRefresh() {
+    // Refresh JWT every 55 minutes (5 minutes before expiry)
+    this.jwtRefreshInterval = setInterval(async () => {
+      try {
+        console.log('Refreshing JWT token...');
+        await this.refreshJwt();
+        
+        // Reconnect with new JWT
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          console.log('Reconnecting with refreshed JWT...');
+          this.ws.close();
+          await this.connect();
+        }
+      } catch (error) {
+        console.error('Failed to refresh JWT:', error.message);
+      }
+    }, 55 * 60 * 1000); // 55 minutes
+  }
+
+  stopJwtRefresh() {
+    if (this.jwtRefreshInterval) {
+      clearInterval(this.jwtRefreshInterval);
+      this.jwtRefreshInterval = null;
+    }
+  }
+
+  async refreshJwt() {
+    try {
+      const authUrl = 'https://ckdjiovqshugcprabpty.functions.supabase.co/agent-auth';
+      
+      const response = await fetch(authUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          registration_token: this.registrationToken
+        })
+      });
+
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to authenticate');
+      }
+
+      const data = await response.json();
+      this.jwt = data.jwt;
+      this.jwtExpiry = Date.now() + (data.expires_in * 1000);
+      
+      console.log('✓ JWT refreshed successfully, expires in', data.expires_in, 'seconds');
+    } catch (error) {
+      console.error('JWT refresh failed:', error.message);
+      throw error;
+    }
+  }
+
+  isJwtExpiringSoon() {
+    if (!this.jwtExpiry) return true;
+    // Consider JWT expiring soon if less than 5 minutes remain
+    return (this.jwtExpiry - Date.now()) < (5 * 60 * 1000);
   }
 
   startBatchTransmit() {
