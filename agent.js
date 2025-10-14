@@ -4,6 +4,8 @@ const WebSocket = require('ws');
 const ModbusRTU = require('modbus-serial');
 const net = require('net');
 const { program } = require('commander');
+const fs = require('fs');
+const path = require('path');
 
 // ============================================================================
 // VALUE CACHE - Tracks last known values for report-by-exception
@@ -66,6 +68,103 @@ class DataTransmitBuffer {
 
   resetFullRefreshTimer() {
     this.lastFullRefresh = Date.now();
+  }
+}
+
+// ============================================================================
+// OFFLINE BUFFER - Persists data to disk when connection is lost
+// ============================================================================
+class OfflineBuffer {
+  constructor(bufferDir = './.modbus-agent-buffer') {
+    this.bufferDir = bufferDir;
+    this.bufferFile = path.join(bufferDir, 'offline-buffer.json');
+    this.maxFileSize = 50 * 1024 * 1024; // 50MB max
+    this.isOffline = false;
+    this.ensureBufferDir();
+  }
+
+  ensureBufferDir() {
+    if (!fs.existsSync(this.bufferDir)) {
+      fs.mkdirSync(this.bufferDir, { recursive: true });
+    }
+  }
+
+  startBuffering() {
+    this.isOffline = true;
+    console.log('[OfflineBuffer] Started offline buffering mode');
+  }
+
+  stopBuffering() {
+    this.isOffline = false;
+    console.log('[OfflineBuffer] Stopped offline buffering mode');
+  }
+
+  addDataPoints(dataPoints) {
+    if (!this.isOffline || !dataPoints || dataPoints.length === 0) return;
+
+    try {
+      let buffer = [];
+      
+      // Load existing buffer
+      if (fs.existsSync(this.bufferFile)) {
+        const fileContent = fs.readFileSync(this.bufferFile, 'utf-8');
+        buffer = JSON.parse(fileContent);
+      }
+
+      // Add new data points
+      buffer.push(...dataPoints);
+
+      // Write back to file
+      fs.writeFileSync(this.bufferFile, JSON.stringify(buffer, null, 2));
+      
+      console.log(`[OfflineBuffer] Buffered ${dataPoints.length} data points (total: ${buffer.length})`);
+    } catch (error) {
+      console.error('[OfflineBuffer] Error writing to buffer:', error.message);
+    }
+  }
+
+  getBufferedData() {
+    try {
+      if (!fs.existsSync(this.bufferFile)) return [];
+      
+      const fileContent = fs.readFileSync(this.bufferFile, 'utf-8');
+      return JSON.parse(fileContent);
+    } catch (error) {
+      console.error('[OfflineBuffer] Error reading buffer:', error.message);
+      return [];
+    }
+  }
+
+  clearBuffer() {
+    try {
+      if (fs.existsSync(this.bufferFile)) {
+        fs.unlinkSync(this.bufferFile);
+        console.log('[OfflineBuffer] Buffer cleared');
+      }
+    } catch (error) {
+      console.error('[OfflineBuffer] Error clearing buffer:', error.message);
+    }
+  }
+
+  getBufferSize() {
+    try {
+      if (!fs.existsSync(this.bufferFile)) return 0;
+      const stats = fs.statSync(this.bufferFile);
+      return stats.size;
+    } catch (error) {
+      return 0;
+    }
+  }
+
+  getRecordCount() {
+    try {
+      if (!fs.existsSync(this.bufferFile)) return 0;
+      const fileContent = fs.readFileSync(this.bufferFile, 'utf-8');
+      const buffer = JSON.parse(fileContent);
+      return buffer.length;
+    } catch (error) {
+      return 0;
+    }
   }
 }
 
@@ -388,11 +487,19 @@ class ModbusAgent {
 
     this.ws.on('open', () => {
       console.log('✓ Connected to Modbus Manager');
-        this.startHeartbeat();
-        this.startBatchTransmit();
-        this.startHistoricalUpload();
-        this.startConfigCheck();
-        this.startJwtRefresh();
+      this.isOnline = true;
+      this.connectionFailureCount = 0;
+      this.lastConnectionTime = Date.now();
+      
+      // Stop offline buffering and upload any buffered data
+      this.offlineBuffer.stopBuffering();
+      this.uploadOfflineBuffer();
+      
+      this.startHeartbeat();
+      this.startBatchTransmit();
+      this.startHistoricalUpload();
+      this.startConfigCheck();
+      this.startJwtRefresh();
     });
 
     this.ws.on('message', (data) => {
@@ -416,6 +523,13 @@ class ModbusAgent {
 
     this.ws.on('close', () => {
       console.log('✗ Disconnected from Modbus Manager');
+      this.isOnline = false;
+      this.connectionFailureCount++;
+      
+      // Start offline buffering
+      this.offlineBuffer.startBuffering();
+      this.updateBufferingStatus();
+      
       this.stopHeartbeat();
       this.stopBatchTransmit();
       this.stopHistoricalUpload();
@@ -426,6 +540,10 @@ class ModbusAgent {
 
     this.ws.on('error', (error) => {
       console.error('WebSocket error:', error.message);
+      if (!this.isOnline) {
+        this.connectionFailureCount++;
+        this.offlineBuffer.startBuffering();
+      }
     });
   }
 
@@ -578,6 +696,15 @@ class ModbusAgent {
 
     console.log(`[HistoricalUpload] Uploading ${dataPoints.length} data points to cloud`);
 
+    // If offline, buffer the data instead
+    if (!this.isOnline || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      console.log('[HistoricalUpload] Offline - buffering data to disk');
+      this.offlineBuffer.addDataPoints(dataPoints);
+      this.historicalBuffer.clearBuffer();
+      this.updateBufferingStatus();
+      return;
+    }
+
     try {
       const response = await fetch('https://ckdjiovqshugcprabpty.supabase.co/functions/v1/ingest-batch', {
         method: 'POST',
@@ -596,19 +723,96 @@ class ModbusAgent {
         if (result.success) {
           console.log(`[HistoricalUpload] Successfully uploaded ${result.inserted} records`);
           this.historicalBuffer.clearBuffer();
+          this.updateBufferingStatus();
         } else {
           console.error('[HistoricalUpload] Upload failed:', result.error || result.errors);
+          // Buffer on failure
+          this.offlineBuffer.addDataPoints(dataPoints);
+          this.updateBufferingStatus();
         }
       } else {
-        const errorText = await response.text();
-        console.error(`[HistoricalUpload] Upload failed (${response.status} ${response.statusText}):`, errorText);
+        console.error('[HistoricalUpload] HTTP error:', response.status);
+        // Buffer on failure
+        this.offlineBuffer.addDataPoints(dataPoints);
+        this.updateBufferingStatus();
       }
     } catch (error) {
-      console.error('[HistoricalUpload] Error uploading historical data:', {
-        message: error.message,
-        stack: error.stack,
-        error: error
+      console.error('[HistoricalUpload] Failed to upload:', error.message);
+      // Buffer on network error
+      this.offlineBuffer.addDataPoints(dataPoints);
+      this.historicalBuffer.clearBuffer();
+      this.updateBufferingStatus();
+    }
+  }
+
+  async uploadOfflineBuffer() {
+    const bufferedData = this.offlineBuffer.getBufferedData();
+    if (bufferedData.length === 0) return;
+
+    console.log(`[OfflineRecovery] Uploading ${bufferedData.length} buffered data points from offline storage`);
+
+    try {
+      // Upload in batches to avoid overwhelming the backend
+      const batchSize = 1000;
+      for (let i = 0; i < bufferedData.length; i += batchSize) {
+        const batch = bufferedData.slice(i, i + batchSize);
+        
+        const response = await fetch('https://ckdjiovqshugcprabpty.supabase.co/functions/v1/ingest-batch', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${this.token}`,
+          },
+          body: JSON.stringify({
+            agentId: this.agentId,
+            dataPoints: batch,
+          }),
+        });
+
+        if (response.ok) {
+          const result = await response.json();
+          if (result.success) {
+            console.log(`[OfflineRecovery] Uploaded batch ${Math.floor(i / batchSize) + 1}: ${result.inserted} records`);
+          }
+        } else {
+          throw new Error(`HTTP ${response.status}`);
+        }
+      }
+
+      // Clear buffer after successful upload
+      this.offlineBuffer.clearBuffer();
+      console.log('[OfflineRecovery] All buffered data uploaded successfully');
+      this.updateBufferingStatus();
+    } catch (error) {
+      console.error('[OfflineRecovery] Failed to upload buffered data:', error.message);
+      console.log('[OfflineRecovery] Will retry on next connection');
+    }
+  }
+
+  async updateBufferingStatus() {
+    if (!this.agentId) return;
+
+    const bufferedRecords = this.offlineBuffer.getRecordCount();
+    const bufferingStatus = this.isOnline 
+      ? (bufferedRecords > 0 ? 'online' : 'online')
+      : 'buffering';
+
+    try {
+      await fetch('https://ckdjiovqshugcprabpty.supabase.co/rest/v1/agents?id=eq.' + this.agentId, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${this.token}`,
+          'apikey': 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNrZGppb3Zxc2h1Z2NwcmFicHR5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTkzNTMzMDIsImV4cCI6MjA3NDkyOTMwMn0.yGXKKQG3KkNv-O8eYsO9YgzsHuYJWXvi6RFJzNBfRHY',
+          'Prefer': 'return=minimal'
+        },
+        body: JSON.stringify({
+          buffering_status: bufferingStatus,
+          buffered_records: bufferedRecords
+        }),
       });
+    } catch (error) {
+      console.error('[BufferingStatus] Failed to update status:', error.message);
     }
   }
 
