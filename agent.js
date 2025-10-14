@@ -50,6 +50,17 @@ class DataTransmitBuffer {
     this.changeBuffer = [];
     this.lastFullRefresh = Date.now();
     this.fullRefreshInterval = fullRefreshInterval;
+    this.healthMetricsInterval = null;
+  }
+
+  getResourceUsage() {
+    const cpuUsage = process.cpuUsage();
+    const memoryUsage = process.memoryUsage();
+    
+    return {
+      cpu: ((cpuUsage.user + cpuUsage.system) / 1000000).toFixed(2), // Convert to seconds
+      memory: (memoryUsage.heapUsed / 1024 / 1024).toFixed(2) // Convert to MB
+    };
   }
 
   queueChange(deviceId, registerId, value, timestamp = new Date().toISOString()) {
@@ -496,6 +507,7 @@ class ModbusAgent {
       this.uploadOfflineBuffer();
       
       this.startHeartbeat();
+      this.startHealthMetrics();
       this.startBatchTransmit();
       this.startHistoricalUpload();
       this.startConfigCheck();
@@ -525,6 +537,9 @@ class ModbusAgent {
       console.log('✗ Disconnected from Modbus Manager');
       this.isOnline = false;
       this.connectionFailureCount++;
+      
+      // Stop health metrics
+      this.stopHealthMetrics();
       
       // Start offline buffering
       this.offlineBuffer.startBuffering();
@@ -622,6 +637,46 @@ class ModbusAgent {
     if (!this.jwtExpiry) return true;
     // Consider JWT expiring soon if less than 5 minutes remain
     return (this.jwtExpiry - Date.now()) < (5 * 60 * 1000);
+  }
+
+  sendHealthMetrics() {
+    try {
+      const metrics = this.transmitBuffer.getResourceUsage();
+      
+      const message = {
+        type: 'heartbeat',
+        agentId: this.config.agentId,
+        timestamp: new Date().toISOString(),
+        cpuUsage: parseFloat(metrics.cpu),
+        memoryUsage: parseFloat(metrics.memory)
+      };
+
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify(message));
+        console.log(`[HealthMetrics] CPU: ${metrics.cpu}s, Memory: ${metrics.memory}MB`);
+      }
+    } catch (error) {
+      console.error('[HealthMetrics] Error sending metrics:', error);
+    }
+  }
+
+  startHealthMetrics() {
+    // Send heartbeat with health metrics every 30 seconds
+    this.transmitBuffer.healthMetricsInterval = setInterval(() => {
+      this.sendHealthMetrics();
+    }, 30000);
+    
+    // Send initial heartbeat immediately
+    this.sendHealthMetrics();
+    console.log('[HealthMetrics] Started sending heartbeat every 30 seconds');
+  }
+
+  stopHealthMetrics() {
+    if (this.transmitBuffer.healthMetricsInterval) {
+      clearInterval(this.transmitBuffer.healthMetricsInterval);
+      this.transmitBuffer.healthMetricsInterval = null;
+      console.log('[HealthMetrics] Stopped sending heartbeat');
+    }
   }
 
   startBatchTransmit() {
