@@ -474,8 +474,14 @@ class ModbusAgent {
     // Polling engine components
     this.valueCache = new ValueCache();
     this.transmitBuffer = new DataTransmitBuffer(300000); // 5 min full refresh
+    this.offlineBuffer = new OfflineBuffer(); // Initialize offline buffer
     this.historicalBuffer = new HistoricalDataBuffer(10000);
     this.pollingScheduler = new PollingScheduler(this);
+
+    // Connection state tracking
+    this.isOnline = false;
+    this.connectionFailureCount = 0;
+    this.lastConnectionTime = null;
 
     // Configuration
     this.batchWindow = 2000; // 2 seconds
