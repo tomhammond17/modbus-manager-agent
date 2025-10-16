@@ -647,11 +647,16 @@ class ModbusAgent {
 
   sendHealthMetrics() {
     try {
+      // Only send if agentId is set
+      if (!this.agentId) {
+        return;
+      }
+
       const metrics = this.transmitBuffer.getResourceUsage();
       
       const message = {
         type: 'heartbeat',
-        agentId: this.config.agentId,
+        agentId: this.agentId,
         timestamp: new Date().toISOString(),
         cpuUsage: parseFloat(metrics.cpu),
         memoryUsage: parseFloat(metrics.memory)
@@ -1256,7 +1261,7 @@ class ModbusAgent {
       const resp = await fetch('https://ckdjiovqshugcprabpty.supabase.co/functions/v1/get-active-config', {
         method: 'GET',
         headers: {
-          'Authorization': `Bearer ${this.token}`,
+          'Authorization': `Bearer ${this.registrationToken}`,
         },
       });
       const result = await resp.json();
